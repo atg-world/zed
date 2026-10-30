@@ -258,6 +258,12 @@ pub struct AgentSettingsContent {
     ///
     /// Default: 5
     pub max_idle_retained_threads: Option<usize>,
+    /// Minutes an idle thread with a loadable session may sit untouched before it is
+    /// unloaded from memory, whatever `max_idle_retained_threads` says. It reloads from
+    /// disk when opened. Set to 0 to turn the timer off.
+    ///
+    /// Default: 30
+    pub idle_thread_unload_minutes: Option<u64>,
     /// Settings for the threads sidebar.
     pub threads_sidebar: Option<ThreadsSidebarSettingsContent>,
     /// Default fixed width in pixels when the agent panel is docked to the left or right and
