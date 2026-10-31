@@ -1189,7 +1189,7 @@
     "max_idle_retained_threads": 5,
     // Minutes an idle thread may sit untouched before it is unloaded from memory
     // (it reloads from disk when opened). Set to 0 to turn the timer off.
-    "idle_thread_unload_minutes": 30,
+    "idle_thread_unload_minutes": 120,
     // Settings for the sidebar holding the agent panel and the list of agent threads.
     "threads_sidebar": {
       // Where to position the Threads Sidebar. Can be 'left' or 'right'.

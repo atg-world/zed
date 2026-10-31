@@ -1320,7 +1320,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn test_idle_thread_unload_minutes_defaults_to_thirty_and_follows_user_settings(
+    fn test_idle_thread_unload_minutes_defaults_to_two_hours_and_follows_user_settings(
         cx: &mut gpui::App,
     ) {
         let store = SettingsStore::test(cx);
@@ -1328,7 +1328,7 @@ mod tests {
         project::DisableAiSettings::register(cx);
         AgentSettings::register(cx);
 
-        assert_eq!(AgentSettings::get_global(cx).idle_thread_unload_minutes, 30);
+        assert_eq!(AgentSettings::get_global(cx).idle_thread_unload_minutes, 120);
 
         for (content, expected) in [
             (r#"{ "agent": { "idle_thread_unload_minutes": 0 } }"#, 0),
