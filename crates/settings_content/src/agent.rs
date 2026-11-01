@@ -262,7 +262,7 @@ pub struct AgentSettingsContent {
     /// unloaded from memory, whatever `max_idle_retained_threads` says. It reloads from
     /// disk when opened. Set to 0 to turn the timer off.
     ///
-    /// Default: 30
+    /// Default: 120
     pub idle_thread_unload_minutes: Option<u64>,
     /// Settings for the threads sidebar.
     pub threads_sidebar: Option<ThreadsSidebarSettingsContent>,
