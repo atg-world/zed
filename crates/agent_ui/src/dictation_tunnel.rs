@@ -1,7 +1,7 @@
 //! Dictation tunnel: lets another program on this PC (DeskBridge, driven from a phone) speak words into the agent panel
 //! while the tunnel is switched on, whichever window is in front.
 //!
-//! Off by default. `agent: toggle dictation tunnel` turns it on or off. While it is on:
+//! Off by default. `agent: toggle dictation tunnel` turns it on or off (or start Zed with ZED_DICTATION_TUNNEL=1). While it is on:
 //!   * Zed listens on 127.0.0.1 only (loopback, a random port) and writes `{port, token}` to
 //!     `<config dir>/dictation-tunnel.json` (on Windows `%APPDATA%\Zed\`), which only this user can read.
 //!   * A client sends one JSON line and gets one line back: `{"ok": true, ...}` or `{"ok": false, "reason": "..."}`.
@@ -161,6 +161,12 @@ impl Global for DictationTunnelState {}
 
 pub fn init(cx: &mut App) {
     cx.set_global(DictationTunnelState::default());
+    // Opt in without a menu: ZED_DICTATION_TUNNEL=1 starts the tunnel with Zed (for the phone app, and for tests).
+    if std::env::var("ZED_DICTATION_TUNNEL").is_ok_and(|value| value == "1") {
+        if let Err(error) = start(cx) {
+            log::error!("dictation tunnel (from environment): {error:#}");
+        }
+    }
     cx.observe_new(
         |workspace: &mut Workspace, _window, _cx: &mut Context<Workspace>| {
             workspace.register_action(|workspace, _: &ToggleDictationTunnel, _window, cx| {
