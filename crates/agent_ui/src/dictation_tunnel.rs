@@ -4,10 +4,16 @@
 //! Off by default. `agent: toggle dictation tunnel` turns it on or off. While it is on:
 //!   * Zed listens on 127.0.0.1 only (loopback, a random port) and writes `{port, token}` to
 //!     `<config dir>/dictation-tunnel.json` (on Windows `%APPDATA%\Zed\`), which only this user can read.
-//!   * A client sends one JSON line `{"token": "...", "text": "...", "backspace": 0, "submit": false}` and gets one line
-//!     back: `{"ok": true}` or `{"ok": false, "reason": "no-chat" | "bad-token" | "bad-request"}`.
-//!   * The text goes into the message box of the open agent thread (the window in front if it has one, else any window).
-//!   * Nothing is ever typed into another window: no open thread means `no-chat`.
+//!   * A client sends one JSON line and gets one line back: `{"ok": true, ...}` or `{"ok": false, "reason": "..."}`.
+//!       - words for the open chat: `{"token", "text"?, "backspace"?, "submit"?}`; they go into the message box of the open
+//!         agent thread (the window in front first, then any window). Nothing is ever typed into another window: no open
+//!         thread means `no-chat`.
+//!       - `{"token", "op": "chats"}`: every chat (not archived) with its project, status (`running`, `needs-you`, `idle`)
+//!         and last-updated time, newest first.
+//!       - `{"token", "op": "chat", "id", "limit"?}`: the last messages of one chat (user, assistant, tool) and its status.
+//!         A chat that is not loaded yet is loaded in the background; the answer is `loading` until it is ready.
+//!       - `{"token", "op": "say", "id", "text"?, "submit"?}`: words for one specific chat, not just the open one.
+//!     This is how the phone shows the same list of chats the sidebar shows, and talks into any of them.
 //! Turning it off closes the listener and deletes the file, so a stale file simply means "off" to the client.
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -17,11 +23,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use gpui::{App, Context, Global, WindowHandle, actions};
+use acp_thread::{AgentThreadEntry, ThreadStatus};
+use gpui::{App, Context, Entity, Global, Window, WindowHandle, actions};
 use serde::Deserialize;
 use workspace::{MultiWorkspace, Workspace};
 
-use crate::AgentPanel;
+use crate::thread_metadata_store::{ThreadMetadata, ThreadMetadataStore};
+use crate::{Agent, AgentPanel, AgentThreadSource, ConversationView};
 
 actions!(
     agent,
@@ -38,9 +46,25 @@ const MAX_LINE_BYTES: u64 = 64 * 1024;
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 const REPLY_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_BACKSPACE: usize = 200;
+const MAX_CHAT_ENTRIES: usize = 200;
+/// One message longer than this is cut (the phone shows a preview; the full text is in Zed).
+const MAX_ENTRY_CHARS: usize = 4_000;
+/// The whole answer stays well under the 200 KB the phone side accepts.
+const MAX_REPLY_CHARS: usize = 120_000;
+const MAX_CHATS: usize = 100;
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum Operation {
+    /// words for the open chat
+    Words,
+    Chats,
+    Chat { id: String, limit: usize },
+    Say { id: String },
+}
 
 #[derive(Debug, PartialEq)]
 pub(crate) struct DictationRequest {
+    pub operation: Operation,
     pub text: String,
     pub backspace: usize,
     pub submit: bool,
@@ -55,6 +79,12 @@ struct WireRequest {
     backspace: usize,
     #[serde(default)]
     submit: bool,
+    #[serde(default)]
+    op: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -78,10 +108,29 @@ pub(crate) fn parse_request(line: &str, expected_token: &str) -> Result<Dictatio
     if !constant_time_eq(wire.token.as_bytes(), expected_token.as_bytes()) {
         return Err(Refusal::BadToken);
     }
-    if wire.text.is_empty() && wire.backspace == 0 && !wire.submit {
-        return Err(Refusal::BadRequest);
-    }
+    let id = wire.id.filter(|id| !id.is_empty() && id.len() <= 64);
+    let operation = match wire.op.as_deref() {
+        None => {
+            if wire.text.is_empty() && wire.backspace == 0 && !wire.submit {
+                return Err(Refusal::BadRequest);
+            }
+            Operation::Words
+        }
+        Some("chats") => Operation::Chats,
+        Some("chat") => Operation::Chat {
+            id: id.ok_or(Refusal::BadRequest)?,
+            limit: wire.limit.unwrap_or(40).clamp(1, MAX_CHAT_ENTRIES),
+        },
+        Some("say") => {
+            if wire.text.is_empty() && !wire.submit && wire.backspace == 0 {
+                return Err(Refusal::BadRequest);
+            }
+            Operation::Say { id: id.ok_or(Refusal::BadRequest)? }
+        }
+        Some(_) => return Err(Refusal::BadRequest),
+    };
     Ok(DictationRequest {
+        operation,
         text: wire.text,
         backspace: wire.backspace.min(MAX_BACKSPACE),
         submit: wire.submit,
@@ -97,7 +146,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 struct Pending {
     request: DictationRequest,
-    reply: mpsc::SyncSender<&'static str>,
+    reply: mpsc::SyncSender<serde_json::Value>,
 }
 
 struct RunningTunnel {
@@ -194,8 +243,8 @@ fn start(cx: &mut App) -> anyhow::Result<()> {
     // The app thread: applies each request to the open chat and tells the connection how it went.
     cx.spawn(async move |cx| {
         while let Ok(pending) = rx.recv().await {
-            let reason = cx.update(|cx| deliver(&pending.request, cx));
-            pending.reply.send(reason).ok();
+            let reply = cx.update(|cx| deliver(&pending.request, cx));
+            pending.reply.send(reply).ok();
         }
     })
     .detach();
@@ -222,40 +271,98 @@ fn handle_connection(stream: TcpStream, token: &str, tx: &async_channel::Sender<
     }
     let mut stream = stream;
     let reply = match parse_request(line.trim_end(), token) {
-        Err(refusal) => refusal.reason(),
+        Err(refusal) => refused(refusal.reason()),
         Ok(request) => {
             let (reply_tx, reply_rx) = mpsc::sync_channel(1);
             if tx.send_blocking(Pending { request, reply: reply_tx }).is_err() {
-                "closed"
+                refused("closed")
             } else {
-                reply_rx.recv_timeout(REPLY_TIMEOUT).unwrap_or("timeout")
+                reply_rx.recv_timeout(REPLY_TIMEOUT).unwrap_or_else(|_| refused("timeout"))
             }
         }
     };
-    let body = if reply.is_empty() {
-        r#"{"ok":true}"#.to_string()
-    } else {
-        serde_json::json!({ "ok": false, "reason": reply }).to_string()
-    };
+    let body = reply.to_string();
     stream.write_all(body.as_bytes()).ok();
     stream.write_all(b"\n").ok();
     stream.shutdown(Shutdown::Both).ok();
 }
 
-/// Puts the request into the open agent thread. Returns "" on success, or the reason it could not.
-fn deliver(request: &DictationRequest, cx: &mut App) -> &'static str {
+fn refused(reason: &str) -> serde_json::Value {
+    serde_json::json!({ "ok": false, "reason": reason })
+}
+
+fn accepted() -> serde_json::Value {
+    serde_json::json!({ "ok": true })
+}
+
+/// Every Zed window, the one in front first.
+fn zed_windows(cx: &App) -> Vec<WindowHandle<MultiWorkspace>> {
     let mut windows: Vec<WindowHandle<MultiWorkspace>> = cx
         .windows()
         .into_iter()
         .filter_map(|window| window.downcast::<MultiWorkspace>())
         .collect();
-    // the window in front goes first
     if let Some(active) = cx.active_window().and_then(|window| window.downcast::<MultiWorkspace>()) {
         windows.retain(|window| window.window_id() != active.window_id());
         windows.insert(0, active);
     }
+    windows
+}
 
-    for window in windows {
+/// The agent panels of one window, with each chat they hold in memory (the open one and the retained ones).
+fn conversations_in(multi_workspace: &MultiWorkspace, cx: &App) -> Vec<(Entity<AgentPanel>, Entity<ConversationView>)> {
+    let mut found = Vec::new();
+    for workspace in multi_workspace.workspaces() {
+        let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) else { continue };
+        for conversation in panel.read(cx).conversation_views() {
+            found.push((panel.clone(), conversation));
+        }
+    }
+    found
+}
+
+fn chat_status(conversation: &ConversationView, cx: &App) -> &'static str {
+    if conversation.root_thread_has_pending_tool_call(cx) {
+        return "needs-you"; // waiting for an approval that only Zed can give
+    }
+    match conversation.root_thread(cx).map(|thread| thread.read(cx).status()) {
+        Some(ThreadStatus::Generating) => "running",
+        _ => "idle",
+    }
+}
+
+fn project_name(metadata: &ThreadMetadata) -> String {
+    metadata
+        .main_worktree_paths()
+        .paths()
+        .first()
+        .and_then(|path| path.file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "No project".to_string())
+}
+
+fn cut(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut cut: String = text.chars().take(max_chars).collect();
+    cut.push('…');
+    cut
+}
+
+/// Runs the request against the open Zed windows and builds the answer.
+fn deliver(request: &DictationRequest, cx: &mut App) -> serde_json::Value {
+    match &request.operation {
+        Operation::Words => deliver_words(request, cx),
+        Operation::Chats => list_chats(cx),
+        Operation::Chat { id, limit } => read_chat(id, *limit, cx),
+        Operation::Say { id } => say(id, request, cx),
+    }
+}
+
+/// Words for the open chat: the window in front first, then any other window.
+fn deliver_words(request: &DictationRequest, cx: &mut App) -> serde_json::Value {
+    for window in zed_windows(cx) {
         let delivered = window.update(cx, |multi_workspace, window, cx| {
             for workspace in multi_workspace.workspaces() {
                 let workspace = workspace.clone();
@@ -264,13 +371,7 @@ fn deliver(request: &DictationRequest, cx: &mut App) -> &'static str {
                     let thread_view = panel.read(cx).active_thread_view(cx)?;
                     thread_view.update(cx, |thread_view, cx| {
                         thread_view.message_editor.update(cx, |message_editor, cx| {
-                            message_editor.apply_dictation(
-                                request.backspace,
-                                &request.text,
-                                request.submit,
-                                window,
-                                cx,
-                            );
+                            message_editor.apply_dictation(request.backspace, &request.text, request.submit, window, cx);
                         });
                     });
                     Some(())
@@ -282,10 +383,158 @@ fn deliver(request: &DictationRequest, cx: &mut App) -> &'static str {
             false
         });
         if matches!(delivered, Ok(true)) {
-            return "";
+            return accepted();
         }
     }
-    "no-chat"
+    refused("no-chat")
+}
+
+/// Every chat that is not archived, newest first, the way the sidebar lists them.
+fn list_chats(cx: &mut App) -> serde_json::Value {
+    let mut live: std::collections::HashMap<String, &'static str> = std::collections::HashMap::new();
+    for window in zed_windows(cx) {
+        window
+            .update(cx, |multi_workspace, _window, cx| {
+                for (_panel, conversation) in conversations_in(multi_workspace, cx) {
+                    let conversation = conversation.read(cx);
+                    live.insert(conversation.thread_id.to_key_string(), chat_status(conversation, cx));
+                }
+            })
+            .ok();
+    }
+    let Some(store) = ThreadMetadataStore::try_global(cx) else {
+        return refused("no-chat");
+    };
+    let mut chats: Vec<&ThreadMetadata> = store.read(cx).entries().filter(|m| !m.archived && !m.is_draft()).collect();
+    chats.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    let chats: Vec<serde_json::Value> = chats
+        .into_iter()
+        .take(MAX_CHATS)
+        .map(|m| {
+            let id = m.thread_id.to_key_string();
+            serde_json::json!({
+                "id": id,
+                "title": cut(&m.display_title(), 200),
+                "project": project_name(m),
+                "status": live.get(&id).copied().unwrap_or("idle"),
+                "updated": m.updated_at.to_rfc3339(),
+            })
+        })
+        .collect();
+    serde_json::json!({ "ok": true, "chats": chats })
+}
+
+/// Finds the chat in memory in any window, or starts loading it (answer `loading`) so the next ask finds it.
+fn with_chat<R>(
+    id: &str,
+    cx: &mut App,
+    mut use_chat: impl FnMut(&Entity<ConversationView>, &mut Window, &mut Context<MultiWorkspace>) -> R,
+) -> Result<R, &'static str> {
+    for window in zed_windows(cx) {
+        let outcome = window.update(cx, |multi_workspace, window, cx| {
+            let conversations = conversations_in(multi_workspace, cx);
+            if let Some((_, conversation)) = conversations.iter().find(|(_, c)| c.read(cx).thread_id.to_key_string() == id) {
+                return Some(use_chat(conversation, window, cx));
+            }
+            None
+        });
+        if let Ok(Some(result)) = outcome {
+            return Ok(result);
+        }
+    }
+    // not in memory: ask the first agent panel to load it (without stealing focus), and tell the caller to ask again
+    let Some(store) = ThreadMetadataStore::try_global(cx) else {
+        return Err("no-chat");
+    };
+    let Some(metadata) = store.read(cx).entries().find(|m| m.thread_id.to_key_string() == id).cloned() else {
+        return Err("no-chat");
+    };
+    for window in zed_windows(cx) {
+        let started = window.update(cx, |multi_workspace, window, cx| {
+            for workspace in multi_workspace.workspaces() {
+                if let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
+                    let metadata = metadata.clone();
+                    panel.update(cx, |panel, cx| {
+                        panel.load_agent_thread(
+                            Agent::from(metadata.agent_id.clone()),
+                            metadata.thread_id,
+                            Some(metadata.worktree_paths.folder_path_list().clone()),
+                            metadata.title.clone(),
+                            false,
+                            AgentThreadSource::AgentPanel,
+                            window,
+                            cx,
+                        );
+                    });
+                    return true;
+                }
+            }
+            false
+        });
+        if matches!(started, Ok(true)) {
+            return Err("loading");
+        }
+    }
+    Err("no-chat")
+}
+
+fn read_chat(id: &str, limit: usize, cx: &mut App) -> serde_json::Value {
+    let read = with_chat(id, cx, |conversation, _window, cx| {
+        let conversation = conversation.read(cx);
+        let status = chat_status(conversation, cx);
+        let Some(thread) = conversation.root_thread(cx) else {
+            return refused("loading");
+        };
+        let thread = thread.read(cx);
+        let entries = thread.entries();
+        let total = entries.len();
+        // newest messages first until the answer is full, then put them back in order
+        let mut budget = MAX_REPLY_CHARS;
+        let mut picked: Vec<serde_json::Value> = Vec::new();
+        for (index, entry) in entries.iter().enumerate().rev().take(limit) {
+            let role = match entry {
+                AgentThreadEntry::UserMessage(_) => "user",
+                AgentThreadEntry::AssistantMessage(_) => "assistant",
+                AgentThreadEntry::ToolCall(_) => "tool",
+                _ => "note",
+            };
+            let text = cut(&entry.to_markdown(cx), MAX_ENTRY_CHARS);
+            if text.len() > budget {
+                break;
+            }
+            budget -= text.len();
+            picked.push(serde_json::json!({ "i": index, "role": role, "text": text }));
+        }
+        picked.reverse();
+        serde_json::json!({
+            "ok": true,
+            "id": id,
+            "title": cut(&thread.title().map(|t| t.to_string()).unwrap_or_default(), 200),
+            "status": status,
+            "total": total,
+            "entries": picked,
+        })
+    });
+    read.unwrap_or_else(|reason| refused(reason))
+}
+
+fn say(id: &str, request: &DictationRequest, cx: &mut App) -> serde_json::Value {
+    let said = with_chat(id, cx, |conversation, window, cx| {
+        let Some(thread_view) = conversation.read(cx).root_thread_view() else {
+            return false;
+        };
+        thread_view.update(cx, |thread_view, cx| {
+            thread_view.message_editor.update(cx, |message_editor, cx| {
+                message_editor.apply_dictation(request.backspace, &request.text, request.submit, window, cx);
+            });
+        });
+        true
+    });
+    match said {
+        Ok(true) => accepted(),
+        Ok(false) => refused("loading"),
+        Err(reason) => refused(reason),
+    }
 }
 
 #[cfg(test)]
@@ -297,7 +546,7 @@ mod tests {
     #[test]
     fn words_backspace_and_submit_are_parsed() {
         let request = parse_request(&format!(r#"{{"token":"{TOKEN}","text":"hello","backspace":2,"submit":true}}"#), TOKEN).unwrap();
-        assert_eq!(request, DictationRequest { text: "hello".into(), backspace: 2, submit: true });
+        assert_eq!(request, DictationRequest { operation: Operation::Words, text: "hello".into(), backspace: 2, submit: true });
     }
 
     #[test]
@@ -316,6 +565,33 @@ mod tests {
     fn backspace_is_clamped() {
         let request = parse_request(&format!(r#"{{"token":"{TOKEN}","backspace":99999}}"#), TOKEN).unwrap();
         assert_eq!(request.backspace, MAX_BACKSPACE);
+    }
+
+    #[test]
+    fn chat_operations_are_parsed_and_validated() {
+        let chats = parse_request(&format!(r#"{{"token":"{TOKEN}","op":"chats"}}"#), TOKEN).unwrap();
+        assert_eq!(chats.operation, Operation::Chats);
+        let chat = parse_request(&format!(r#"{{"token":"{TOKEN}","op":"chat","id":"abc","limit":9999}}"#), TOKEN).unwrap();
+        assert_eq!(chat.operation, Operation::Chat { id: "abc".into(), limit: MAX_CHAT_ENTRIES });
+        let say = parse_request(&format!(r#"{{"token":"{TOKEN}","op":"say","id":"abc","text":"hi","submit":true}}"#), TOKEN).unwrap();
+        assert_eq!(say.operation, Operation::Say { id: "abc".into() });
+        assert!(say.submit);
+    }
+
+    #[test]
+    fn chat_operations_without_an_id_or_with_nothing_to_say_are_refused() {
+        assert_eq!(parse_request(&format!(r#"{{"token":"{TOKEN}","op":"chat"}}"#), TOKEN), Err(Refusal::BadRequest));
+        assert_eq!(parse_request(&format!(r#"{{"token":"{TOKEN}","op":"say","id":"abc"}}"#), TOKEN), Err(Refusal::BadRequest));
+        assert_eq!(parse_request(&format!(r#"{{"token":"{TOKEN}","op":"say","text":"hi"}}"#), TOKEN), Err(Refusal::BadRequest));
+        assert_eq!(parse_request(&format!(r#"{{"token":"{TOKEN}","op":"rm -rf"}}"#), TOKEN), Err(Refusal::BadRequest));
+        let long_id = "x".repeat(65);
+        assert_eq!(parse_request(&format!(r#"{{"token":"{TOKEN}","op":"chat","id":"{long_id}"}}"#), TOKEN), Err(Refusal::BadRequest));
+    }
+
+    #[test]
+    fn long_text_is_cut_with_an_ellipsis() {
+        assert_eq!(cut("short", 10), "short");
+        assert_eq!(cut("abcdefghij", 4), "abcd…");
     }
 
     #[test]
