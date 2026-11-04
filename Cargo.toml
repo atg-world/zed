@@ -109,6 +109,7 @@ members = [
     "crates/gpui_windows",
     "crates/grammars",
     "crates/hang_telemetry",
+    "crates/html_preview",
     "crates/html_to_markdown",
     "crates/http_client",
     "crates/http_client_tls",
@@ -383,6 +384,7 @@ gpui_wgpu = { path = "crates/gpui_wgpu" }
 gpui_windows = { path = "crates/gpui_windows", default-features = false }
 grammars = { path = "crates/grammars" }
 hang_telemetry = { path = "crates/hang_telemetry" }
+html_preview = { path = "crates/html_preview" }
 html_to_markdown = { path = "crates/html_to_markdown" }
 http_client = { path = "crates/http_client" }
 http_client_tls = { path = "crates/http_client_tls" }
@@ -998,6 +1000,8 @@ wasm-bindgen = "0.2.120"
 wasm-bindgen-futures = "0.4"
 wasmtime-wasi = { version = "48.0.7", default-features = false, features = ["p2"] }
 wax = { version = "0.7", default-features = false }
+# ATG: the page viewer (crates/html_preview) draws pages with the system WebView2; Windows only.
+wry = { version = "0.57", default-features = false, features = ["os-webview"] }
 web-sys = "0.3"
 web-time = "1.1.0"
 webpki-roots = "1.0.10"
