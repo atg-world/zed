@@ -1187,6 +1187,9 @@
     // agent panel. Set to 0 to unload every eligible idle thread when it is
     // no longer active.
     "max_idle_retained_threads": 5,
+    // Minutes an idle thread may sit untouched before it is unloaded from memory
+    // (it reloads from disk when opened). Set to 0 to turn the timer off.
+    "idle_thread_unload_minutes": 120,
     // Settings for the sidebar holding the agent panel and the list of agent threads.
     "threads_sidebar": {
       // Where to position the Threads Sidebar. Can be 'left' or 'right'.
@@ -1382,11 +1385,11 @@
     // Whether to have edit cards in the agent panel expanded, showing a preview of the full diff.
     //
     // Default: true
-    "expand_edit_card": true,
+    "expand_edit_card": false,
     // Whether to have terminal cards in the agent panel expanded, showing the whole command output.
     //
     // Default: true
-    "expand_terminal_card": true,
+    "expand_terminal_card": false,
     // Command to automatically run when Zed creates a Terminal Thread shell in the agent panel.
     // The command is sent to the shell as if typed, so it is interpreted by your
     // configured shell (including on Windows and remote/WSL projects).
@@ -1397,7 +1400,7 @@
     // How thinking blocks should be displayed by default in the agent panel.
     //
     // Default: auto
-    "thinking_display": "auto",
+    "thinking_display": "always_collapsed",
     // Whether clicking the stop button on a running terminal tool should also cancel the agent's generation.
     // Note that this only applies to the stop button, not to ctrl+c inside the terminal.
     //

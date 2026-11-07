@@ -11,6 +11,7 @@ mod context;
 mod context_server_configuration;
 pub(crate) mod conversation_view;
 mod diagnostics;
+mod dictation_tunnel;
 pub mod draft_prompt_store;
 mod entry_view_state;
 mod external_source_prompt;
@@ -684,6 +685,7 @@ pub fn init(
 ) {
     agent::ThreadStore::init_global(cx);
     prompt_store::init(cx);
+    dictation_tunnel::init(cx);
 
     cx.set_global(agent_skills::SkillsUpdatedHook(std::rc::Rc::new(|cx| {
         let workspaces: Vec<_> = workspace::AppState::global(cx)
@@ -1107,6 +1109,7 @@ mod tests {
             show_turn_stats: false,
             show_merge_conflict_indicator: true,
             max_idle_retained_threads: 5,
+            idle_thread_unload_minutes: 120,
             threads_sidebar: agent_settings::ThreadsSidebarSettings {
                 auto_open: true,
                 default_width: px(300.),

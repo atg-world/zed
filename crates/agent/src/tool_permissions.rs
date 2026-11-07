@@ -609,6 +609,7 @@ mod tests {
             show_turn_stats: false,
             show_merge_conflict_indicator: true,
             max_idle_retained_threads: 5,
+            idle_thread_unload_minutes: 120,
             threads_sidebar: agent_settings::ThreadsSidebarSettings {
                 auto_open: true,
                 default_width: px(300.),

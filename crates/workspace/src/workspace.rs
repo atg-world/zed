@@ -4979,7 +4979,10 @@ impl Workspace {
             }
         }
 
-        // If another dock is zoomed, hide it.
+        // If another dock is zoomed, make room for what is being revealed.
+        // ATG: when it is the centre (a file opened, a pane clicked) the zoomed panel shrinks back to its docked
+        // size and stays open, so a file opened from the full-screen chat appears beside the chat instead of
+        // replacing it. Upstream closes the panel here. Revealing another dock still hides the zoomed one.
         let mut focus_center = false;
         for dock in self.all_docks() {
             dock.update(cx, |dock, cx| {
@@ -4988,7 +4991,12 @@ impl Workspace {
                     && panel.is_zoomed(window, cx)
                 {
                     focus_center |= panel.panel_focus_handle(cx).contains_focused(window, cx);
-                    dock.set_open(false, window, cx);
+                    if dock_to_reveal.is_none() {
+                        panel.set_zoomed(false, window, cx);
+                        cx.notify();
+                    } else {
+                        dock.set_open(false, window, cx);
+                    }
                 }
             });
         }
@@ -19717,6 +19725,61 @@ mod tests {
                 "Dock should stay open when its zoomed panel (without pane()) still has focus"
             );
             assert!(panel.is_zoomed(window, cx));
+        });
+    }
+
+    // ATG: opening a file (the centre gets focus) while a panel is full screen must shrink the panel, not close it.
+    #[gpui::test]
+    async fn test_zoomed_panel_shrinks_instead_of_closing_when_center_is_revealed(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            workspace
+                .left_dock()
+                .update(cx, |dock, cx| dock.set_open(true, window, cx));
+            panel
+        });
+
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        pane.update_in(cx, |pane, window, cx| {
+            let item = cx.new(TestItem::new);
+            pane.add_item(Box::new(item), true, true, None, window, cx);
+        });
+
+        // the real-world flow: the chat panel is made the active, focused panel, then goes full screen
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<TestPanel>(window, cx);
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            panel.set_zoomed(true, window, cx);
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert!(panel.is_zoomed(window, cx), "the panel starts full screen");
+            // a file opened from the full-screen chat: focus is in the centre, not in the panel
+            window.focus(&pane.read(cx).focus_handle(cx), cx);
+            assert!(!panel.read(cx).focus_handle(cx).contains_focused(window, cx));
+            workspace.dismiss_zoomed_items_to_reveal(None, window, cx);
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert!(
+                workspace.left_dock().read(cx).is_open(),
+                "the panel stays open beside the file"
+            );
+            assert!(
+                !panel.is_zoomed(window, cx),
+                "the panel gives the file its space"
+            );
+            assert!(workspace.zoomed.is_none() && workspace.zoomed_position.is_none());
         });
     }
 

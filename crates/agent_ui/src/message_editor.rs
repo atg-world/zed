@@ -1955,6 +1955,29 @@ impl MessageEditor {
         });
     }
 
+    /// Dictation tunnel (see dictation_tunnel.rs): delete `backspace` characters before the cursor, insert `text`, and
+    /// send the message when `submit` is set. The same three things the voice layer does while someone is speaking.
+    pub fn apply_dictation(
+        &mut self,
+        backspace: usize,
+        text: &str,
+        submit: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if backspace > 0 {
+            self.editor.update(cx, |editor, cx| {
+                for _ in 0..backspace {
+                    editor.backspace(&editor::actions::Backspace, window, cx);
+                }
+            });
+        }
+        self.insert_text(text, window, cx);
+        if submit {
+            self.send(cx);
+        }
+    }
+
     pub fn set_placeholder_text(
         &mut self,
         placeholder: &str,

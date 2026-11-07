@@ -1530,6 +1530,20 @@ impl AgentPanel {
             this.cleanup_retained_threads(cx);
         });
 
+        // The idle timer needs a clock: nothing else re-runs the cleanup while every thread sits quiet.
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(60)).await;
+                if this
+                    .update(cx, |this, cx| this.cleanup_retained_threads(cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+
         cx.on_release(|this, cx| {
             this.dismiss_all_terminal_notifications(cx);
         })
@@ -4318,10 +4332,23 @@ impl AgentPanel {
 
         potential_removals.sort_unstable_by_key(|(_, view)| view.read(cx).updated_at(cx));
         let n = potential_removals.len().saturating_sub(max_idle);
+        let unload_after = match AgentSettings::get_global(cx).idle_thread_unload_minutes {
+            0 => None,
+            minutes => Some(Duration::from_secs(minutes * 60)),
+        };
+        // Over the count limit (oldest first), or untouched for longer than the idle timer.
         let to_remove = potential_removals
             .into_iter()
-            .map(|(id, _)| *id)
-            .take(n)
+            .enumerate()
+            .filter(|(index, (_, view))| {
+                *index < n
+                    || unload_after.is_some_and(|limit| {
+                        view.read(cx)
+                            .updated_at(cx)
+                            .is_some_and(|updated_at| updated_at.elapsed() >= limit)
+                    })
+            })
+            .map(|(_, (id, _))| *id)
             .collect::<Vec<_>>();
         for id in to_remove {
             self.remove_retained_thread(&id);
