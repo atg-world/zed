@@ -431,6 +431,23 @@ fn list_chats(cx: &mut App) -> serde_json::Value {
     chats_answer(chats, active_chat_id(cx))
 }
 
+/// The name to show for a chat: the one the sidebar shows (it includes a rename the person typed), else the thread's own title.
+/// The thread's own title is generated and a rename never changes it, so reading it alone shows the old name forever.
+fn chat_title(sidebar: Option<String>, thread_own: Option<String>) -> String {
+    sidebar
+        .filter(|title| !title.trim().is_empty())
+        .or(thread_own)
+        .unwrap_or_default()
+}
+
+/// The chat's name as the sidebar shows it (renames included), if the chat is in the sidebar's store.
+fn sidebar_title(id: &str, cx: &App) -> Option<String> {
+    let store = ThreadMetadataStore::try_global(cx)?;
+    let store = store.read(cx);
+    let found = store.entries().find(|m| m.thread_id.to_key_string() == id)?;
+    Some(found.display_title().to_string())
+}
+
 /// The answer to `chats`: the list, and which chat is showing in the agent panel of the window in front (null when none), so a
 /// phone can follow the chat the person just clicked in Zed.
 fn chats_answer(chats: Vec<serde_json::Value>, active: Option<String>) -> serde_json::Value {
@@ -540,7 +557,7 @@ fn read_chat(id: &str, limit: usize, cx: &mut App) -> serde_json::Value {
         serde_json::json!({
             "ok": true,
             "id": id,
-            "title": cut(&thread.title().map(|t| t.to_string()).unwrap_or_default(), 200),
+            "title": cut(&chat_title(sidebar_title(id, cx), thread.title().map(|t| t.to_string())), 200),
             "status": status,
             "total": total,
             "entries": picked,
@@ -617,6 +634,14 @@ mod tests {
         assert_eq!(parse_request(&format!(r#"{{"token":"{TOKEN}","op":"rm -rf"}}"#), TOKEN), Err(Refusal::BadRequest));
         let long_id = "x".repeat(65);
         assert_eq!(parse_request(&format!(r#"{{"token":"{TOKEN}","op":"chat","id":"{long_id}"}}"#), TOKEN), Err(Refusal::BadRequest));
+    }
+
+    #[test]
+    fn a_renamed_chat_shows_its_new_name_not_the_generated_one() {
+        assert_eq!(chat_title(Some("Payroll fixes".into()), Some("Old generated title".into())), "Payroll fixes");
+        assert_eq!(chat_title(None, Some("Old generated title".into())), "Old generated title");
+        assert_eq!(chat_title(Some("  ".into()), Some("Old generated title".into())), "Old generated title");
+        assert_eq!(chat_title(None, None), "");
     }
 
     #[test]

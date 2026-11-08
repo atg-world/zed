@@ -194,6 +194,12 @@ fn log_worktree_diagnostics(
     let mut worktree_store_ids = HashSet::new();
     let mut store_count = 0;
     let mut aggregate = WorktreeStoreDiagnostics::default();
+    // Where the memory goes (ERP-2333): the heaviest folders, the open buffers and the git repositories, so a growth in
+    // "resident" can be matched to a part instead of guessed.
+    let mut folders: Vec<(usize, std::path::PathBuf)> = Vec::new();
+    let mut buffer_count = 0usize;
+    let mut buffer_bytes = 0usize;
+    let mut repository_count = 0usize;
 
     for project in live_projects {
         let worktree_store = project.read(cx).worktree_store();
@@ -201,6 +207,15 @@ fn log_worktree_diagnostics(
             continue;
         }
         store_count += 1;
+        for worktree in worktree_store.read(cx).worktrees() {
+            let worktree = worktree.read(cx);
+            folders.push((worktree.snapshot().entry_count(), worktree.abs_path().to_path_buf()));
+        }
+        for buffer in project.read(cx).buffer_store().read(cx).buffers() {
+            buffer_count += 1;
+            buffer_bytes += buffer.read(cx).len();
+        }
+        repository_count += project.read(cx).git_store().read(cx).repositories().len();
 
         let WorktreeStoreDiagnostics {
             worktree_slots,
@@ -254,6 +269,18 @@ fn log_worktree_diagnostics(
             "worktree diagnostics: projects {project_count}, orphaned projects {orphaned_project_count}, stores {store_count}, slots {worktree_slots}, live {live_worktrees}, visible {visible_worktrees}, strong {strong_handles}, dead weak {dead_weak_handles}, loading {loading_worktrees}, entries {total_entries}, visible entries {visible_entries}, largest none",
         ),
     }
+
+    folders.sort_by(|a, b| b.0.cmp(&a.0));
+    let heaviest = folders
+        .iter()
+        .take(5)
+        .map(|(entries, path)| format!("{} ({entries})", path.display()))
+        .collect::<Vec<_>>()
+        .join("; ");
+    log::info!(
+        "memory breakdown: heaviest folders [{heaviest}]; open buffers {buffer_count} ({} KiB of text); git repositories {repository_count}",
+        buffer_bytes / 1024,
+    );
 }
 
 pub async fn upload_previous_minidumps(client: Arc<Client>) -> anyhow::Result<()> {

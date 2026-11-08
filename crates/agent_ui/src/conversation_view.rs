@@ -1363,6 +1363,12 @@ impl ConversationView {
         let side = crate::agent_sidebar_side(cx);
         let thread_location = "current_worktree";
 
+        // Click-to-text timing (ERP-2323): how long each step of opening a chat takes, written to the log so it is measured, not guessed.
+        let opened_at = std::time::Instant::now();
+        let chat_label = resume_session_id
+            .as_ref()
+            .map(|id| id.0.to_string())
+            .unwrap_or_else(|| "new".to_string());
         let load_task = cx.spawn_in(window, async move |this, cx| {
             let connection = match connect_result.await {
                 Ok(AgentConnectedState { connection, .. }) => connection,
@@ -1392,6 +1398,10 @@ impl ConversationView {
             })
             .log_err();
 
+            log::info!(
+                "[chat-open] chat={chat_label} phase=agent-connected ms={}",
+                opened_at.elapsed().as_millis()
+            );
             telemetry::event!(
                 "Agent Thread Started",
                 agent = connection.telemetry_id(),
@@ -1450,7 +1460,13 @@ impl ConversationView {
                 return;
             };
 
-            let result = match result.await {
+            let result = result.await;
+            log::info!(
+                "[chat-open] chat={chat_label} phase=history-received ms={} ok={}",
+                opened_at.elapsed().as_millis(),
+                result.is_ok()
+            );
+            let result = match result {
                 Err(error) => {
                     if let Some(auth_required) = AuthRequired::from_error(&error) {
                         cx.update(|window, cx| {
@@ -1532,6 +1548,10 @@ impl ConversationView {
                         if let Some(recovery) = this.recovery.take() {
                             this.saved_submissions.extend(recovery.submissions);
                         }
+                        log::info!(
+                            "[chat-open] chat={chat_label} phase=chat-view-built ms={}",
+                            opened_at.elapsed().as_millis()
+                        );
                     }
                     Err(err) => {
                         this.handle_load_error(

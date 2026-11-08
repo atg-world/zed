@@ -1800,6 +1800,17 @@
     "**/Thumbs.db",
     "**/.classpath",
     "**/.settings",
+    // ATG fork (ERP-2333): generated and downloaded folders nobody edits by hand. Zed keeps a record of every file it scans, about
+    // 300 MB per 100,000 files, and in folders that are not git projects nothing else keeps these out. Measured on the intranet
+    // folder: 70% of its files were these. Remove an entry here if you really edit that folder by hand.
+    "**/node_modules",
+    "**/target",
+    "**/.next",
+    "**/dist",
+    "**/__pycache__",
+    "**/.venv",
+    "**/venv",
+    "**/coverage",
   ],
   // Files or globs of files that will be included by Zed, even when ignored by git. This is useful
   // for files that are not tracked by git, but are still important to your project. Note that globs
