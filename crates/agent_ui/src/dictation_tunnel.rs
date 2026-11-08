@@ -8,8 +8,9 @@
 //!       - words for the open chat: `{"token", "text"?, "backspace"?, "submit"?}`; they go into the message box of the open
 //!         agent thread (the window in front first, then any window). Nothing is ever typed into another window: no open
 //!         thread means `no-chat`.
-//!       - `{"token", "op": "chats"}`: every chat (not archived) with its project, status (`running`, `needs-you`, `idle`)
-//!         and last-updated time, newest first.
+//!       - `{"token", "op": "chats"}`: every chat (not archived) with its project, status (`running`, `needs-you`, `idle`) and
+//!         last-updated time, newest first; plus `active`, the id of the chat showing in the window in front (null when none), so a
+//!         phone follows the chat you click in Zed.
 //!       - `{"token", "op": "chat", "id", "limit"?}`: the last messages of one chat (user, assistant, tool) and its status.
 //!         A chat that is not loaded yet is loaded in the background; the answer is `loading` until it is ready.
 //!       - `{"token", "op": "say", "id", "text"?, "submit"?}`: words for one specific chat, not just the open one.
@@ -427,7 +428,31 @@ fn list_chats(cx: &mut App) -> serde_json::Value {
             })
         })
         .collect();
-    serde_json::json!({ "ok": true, "chats": chats })
+    chats_answer(chats, active_chat_id(cx))
+}
+
+/// The answer to `chats`: the list, and which chat is showing in the agent panel of the window in front (null when none), so a
+/// phone can follow the chat the person just clicked in Zed.
+fn chats_answer(chats: Vec<serde_json::Value>, active: Option<String>) -> serde_json::Value {
+    serde_json::json!({ "ok": true, "chats": chats, "active": active })
+}
+
+/// The chat showing in the agent panel of the window in front (the one the person last clicked), if a chat is showing.
+fn active_chat_id(cx: &mut App) -> Option<String> {
+    for window in zed_windows(cx) {
+        let found = window
+            .update(cx, |multi_workspace, _window, cx| {
+                let panel = multi_workspace.workspace().read(cx).panel::<AgentPanel>(cx)?;
+                let id = panel.read(cx).active_thread_id(cx)?;
+                Some(id.to_key_string())
+            })
+            .ok()
+            .flatten();
+        if found.is_some() {
+            return found;
+        }
+    }
+    None
 }
 
 /// Finds the chat in memory in any window, or starts loading it (answer `loading`) so the next ask finds it.
@@ -592,6 +617,16 @@ mod tests {
         assert_eq!(parse_request(&format!(r#"{{"token":"{TOKEN}","op":"rm -rf"}}"#), TOKEN), Err(Refusal::BadRequest));
         let long_id = "x".repeat(65);
         assert_eq!(parse_request(&format!(r#"{{"token":"{TOKEN}","op":"chat","id":"{long_id}"}}"#), TOKEN), Err(Refusal::BadRequest));
+    }
+
+    #[test]
+    fn the_chat_list_says_which_chat_is_in_front() {
+        let chats = vec![serde_json::json!({ "id": "a" }), serde_json::json!({ "id": "b" })];
+        let answer = chats_answer(chats.clone(), Some("b".into()));
+        assert_eq!(answer["ok"], true);
+        assert_eq!(answer["active"], "b");
+        assert_eq!(answer["chats"].as_array().map(|list| list.len()), Some(2));
+        assert!(chats_answer(chats, None)["active"].is_null(), "no chat showing: null, so a phone does not follow anything");
     }
 
     #[test]
