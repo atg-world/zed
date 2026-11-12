@@ -48,8 +48,9 @@ const READ_TIMEOUT: Duration = Duration::from_secs(5);
 const REPLY_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_BACKSPACE: usize = 200;
 const MAX_CHAT_ENTRIES: usize = 200;
-/// One message longer than this is cut (the phone shows a preview; the full text is in Zed).
-const MAX_ENTRY_CHARS: usize = 4_000;
+/// One message longer than this is cut (the full text is in Zed). It was 4,000, which cut a normal long answer in the middle of a
+/// sentence on the phone (12 Nov 2026); 30,000 is well above any answer read on a phone and still fits the whole-answer budget below.
+const MAX_ENTRY_CHARS: usize = 30_000;
 /// The whole answer stays well under the 200 KB the phone side accepts.
 const MAX_REPLY_CHARS: usize = 120_000;
 const MAX_CHATS: usize = 100;
@@ -658,6 +659,13 @@ mod tests {
     fn long_text_is_cut_with_an_ellipsis() {
         assert_eq!(cut("short", 10), "short");
         assert_eq!(cut("abcdefghij", 4), "abcd…");
+    }
+
+    #[test]
+    fn a_long_but_normal_answer_reaches_the_phone_whole() {
+        // 12 Nov 2026: a ~6,000 character answer was cut mid-sentence at the old 4,000 limit.
+        let answer = "a".repeat(6_000);
+        assert_eq!(cut(&answer, MAX_ENTRY_CHARS), answer);
     }
 
     #[test]
