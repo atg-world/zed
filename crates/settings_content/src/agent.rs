@@ -367,6 +367,11 @@ pub struct AgentSettingsContent {
     ///
     /// Default: true
     pub expand_terminal_card: Option<bool>,
+    /// Whether to fold every step between your prompt and the agent's answer (tool calls, thinking, and what it says before
+    /// another tool call) into one row that opens on a click. Anything waiting for you, such as a permission request, stays visible.
+    ///
+    /// Default: true
+    pub collapse_steps: Option<bool>,
     /// Command to automatically run when Zed creates a Terminal Thread shell in the agent panel.
     /// The command is sent to the shell as if typed, so it is interpreted by your
     /// configured shell (including on Windows and remote/WSL projects).

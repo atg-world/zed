@@ -760,6 +760,8 @@ pub struct ThreadView {
     pub list_state: ListState,
     pub session_capabilities: SharedSessionCapabilities,
     pub expanded_tool_call_raw_inputs: HashSet<acp_v2::ToolCallId>,
+    /// Folds of steps (see step_fold.rs) the person has opened, by the entry index where the fold starts.
+    expanded_step_folds: HashSet<usize>,
     collapsed_sandbox_authorization_details: HashSet<acp_v2::ToolCallId>,
     collapsed_sandbox_network_details: HashSet<acp_v2::ToolCallId>,
     /// Sandbox escalation prompts whose "surprising Unicode" warning the user
@@ -1285,6 +1287,7 @@ impl ThreadView {
             last_token_limit_telemetry: None,
             thread_feedback: Default::default(),
             expanded_tool_call_raw_inputs: HashSet::default(),
+            expanded_step_folds: HashSet::default(),
             collapsed_sandbox_authorization_details: HashSet::default(),
             collapsed_sandbox_network_details: HashSet::default(),
             acknowledged_confusable_warnings: HashSet::default(),
@@ -7268,6 +7271,111 @@ fn sandbox_network_rows(network: &SandboxNetPolicy) -> Vec<SandboxRow> {
 }
 
 impl ThreadView {
+    /// Which entries are folded away as steps (see step_fold.rs). Everything is shown when the setting is off, in a subagent's own
+    /// view, and while anything is waiting for the person (a hidden question would look like a hang).
+    fn step_folds(&self, cx: &Context<Self>) -> Vec<step_fold::Slot> {
+        let thread = self.thread.read(cx);
+        let entries = thread.entries();
+        if !AgentSettings::get_global(cx).collapse_steps
+            || self.is_subagent()
+            || thread.is_waiting_for_confirmation()
+            || self.has_pending_request_elicitation(cx)
+        {
+            return vec![step_fold::Slot::Shown; entries.len()];
+        }
+        let kinds: Vec<step_fold::EntryKind> = entries
+            .iter()
+            .map(|entry| match entry {
+                AgentThreadEntry::UserMessage(_) => step_fold::EntryKind::User,
+                AgentThreadEntry::AssistantMessage(message) => {
+                    let has_text = message.chunks.iter().any(|chunk| {
+                        matches!(chunk, AssistantMessageChunk::Message { block, .. } if block.visible_content(cx))
+                    });
+                    if has_text {
+                        step_fold::EntryKind::AssistantText
+                    } else {
+                        step_fold::EntryKind::AssistantThought
+                    }
+                }
+                AgentThreadEntry::ToolCall(tool_call) => {
+                    if self.tool_call_needs_person(tool_call, cx) {
+                        step_fold::EntryKind::ToolNeedsPerson
+                    } else {
+                        step_fold::EntryKind::Tool
+                    }
+                }
+                _ => step_fold::EntryKind::Other,
+            })
+            .collect();
+        step_fold::plan(&kinds)
+    }
+
+    /// A tool call the person has to act on: waiting for confirmation, or holding a permission request.
+    fn tool_call_needs_person(&self, tool_call: &ToolCall, cx: &Context<Self>) -> bool {
+        if matches!(tool_call.status(), ToolCallStatus::WaitingForConfirmation) || tool_call.authorization_id().is_some() {
+            return true;
+        }
+        let conversation = self.conversation.read(cx);
+        let thread = self.thread.read(cx);
+        conversation.permission_requests.get(&self.session_id).is_some_and(|requests| {
+            requests.iter().any(|request_id| {
+                thread
+                    .permission_request(*request_id)
+                    .and_then(|request| request.generic_request())
+                    .and_then(|request| Self::permission_tool_call(thread, request))
+                    .is_some_and(|(_, subject)| subject.id == tool_call.id)
+            })
+        })
+    }
+
+    fn failed_steps_in_fold(&self, fold: usize, folds: &[step_fold::Slot], cx: &Context<Self>) -> usize {
+        let entries = self.thread.read(cx).entries();
+        folds
+            .iter()
+            .enumerate()
+            .filter(|(index, slot)| {
+                (*index == fold && matches!(slot, step_fold::Slot::Header { .. }))
+                    || matches!(slot, step_fold::Slot::Step { fold: f } if *f == fold)
+            })
+            .filter(|(index, _)| {
+                matches!(entries.get(*index), Some(AgentThreadEntry::ToolCall(tool_call)) if matches!(tool_call.status(), ToolCallStatus::Failed))
+            })
+            .count()
+    }
+
+    fn render_step_fold_header(&self, entry_ix: usize, steps: usize, failed: usize, running: bool, open: bool, cx: &Context<Self>) -> AnyElement {
+        let count = if steps == 1 { "1 step".to_string() } else { format!("{steps} steps") };
+        let label = match (running, failed) {
+            (true, 0) => format!("Working · {count}"),
+            (true, n) => format!("Working · {count} · {n} failed"),
+            (false, 0) => count,
+            (false, n) => format!("{count} · {n} failed"),
+        };
+        h_flex()
+            .id(("step-fold", entry_ix))
+            .w_full()
+            .px_5()
+            .py_1()
+            .gap_1()
+            .cursor_pointer()
+            .rounded_sm()
+            .hover(|style| style.bg(cx.theme().colors().element_hover))
+            .child(
+                Icon::new(if open { IconName::ChevronDown } else { IconName::ChevronRight })
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(Label::new(label).size(LabelSize::Small).color(if failed > 0 { Color::Warning } else { Color::Muted }))
+            .on_click(cx.listener(move |this, _, _window, cx| {
+                if !this.expanded_step_folds.remove(&entry_ix) {
+                    this.expanded_step_folds.insert(entry_ix);
+                }
+                this.list_state.remeasure_items(entry_ix..this.list_state.item_count());
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
     fn render_entries(&mut self, cx: &mut Context<Self>) -> List {
         let max_content_width = AgentSettings::get_global(cx).max_content_width;
         let centered_container = move |content: AnyElement| {
@@ -7279,12 +7387,33 @@ impl ThreadView {
             )
         };
 
+        let folds = std::rc::Rc::new(self.step_folds(cx));
+
         list(
             self.list_state.clone(),
             cx.processor(move |this, index: usize, window, cx| {
                 let entries = this.thread.read(cx).entries();
                 if let Some(entry) = entries.get(index) {
-                    let rendered = this.render_entry(index, entries.len(), entry, window, cx);
+                    let rendered = match folds.get(index).copied().unwrap_or(step_fold::Slot::Shown) {
+                        step_fold::Slot::Shown => this.render_entry(index, entries.len(), entry, window, cx),
+                        step_fold::Slot::Step { fold } if !this.expanded_step_folds.contains(&fold) => Empty.into_any_element(),
+                        step_fold::Slot::Step { .. } => this.render_entry(index, entries.len(), entry, window, cx),
+                        step_fold::Slot::Header { steps, last_turn } => {
+                            let open = this.expanded_step_folds.contains(&index);
+                            let failed = this.failed_steps_in_fold(index, &folds, cx);
+                            let running = last_turn && this.thread.read(cx).status() == ThreadStatus::Generating;
+                            let header = this.render_step_fold_header(index, steps, failed, running, open, cx);
+                            if open {
+                                v_flex()
+                                    .w_full()
+                                    .child(header)
+                                    .child(this.render_entry(index, entries.len(), entry, window, cx))
+                                    .into_any_element()
+                            } else {
+                                header
+                            }
+                        }
+                    };
                     centered_container(rendered.into_any_element()).into_any_element()
                 } else if this.generating_indicator_in_list {
                     let confirmation = this.thread.read(cx).is_waiting_for_confirmation()
