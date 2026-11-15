@@ -1365,6 +1365,15 @@ impl ThreadMetadataStore {
             crate::draft_prompt_store::delete(thread_id, cx).detach_and_log_err(cx);
         }
 
+        if let Some(existing) = existing_thread {
+            if !existing.archived && existing.folder_paths() != worktree_paths.folder_path_list() {
+                log::info!(
+                    "[threads] a chat update is about to save the folder of the project it runs in ({:?}) over the chat's own",
+                    worktree_paths.folder_path_list().ordered_paths().map(|p| p.display().to_string()).collect::<Vec<_>>()
+                );
+            }
+        }
+
         let metadata = ThreadMetadata {
             thread_id,
             session_id,

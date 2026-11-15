@@ -4228,6 +4228,13 @@ impl AgentPanel {
             thread_ids.push(active_id);
         }
         if !thread_ids.is_empty() {
+            // ERP-2380: this is one of the two places that rewrite a chat's saved folder (the other is a chat update, in
+            // thread_metadata_store.rs). Log it, so a chat that "moved to another project" can be traced to its trigger.
+            log::info!(
+                "[threads] this panel's project folders are [{}]: {} chats in memory follow them",
+                new_worktree_paths.folder_path_list().ordered_paths().map(|p| p.display().to_string()).collect::<Vec<_>>().join(";"),
+                thread_ids.len()
+            );
             ThreadMetadataStore::global(cx).update(cx, |store, cx| {
                 store.update_worktree_paths(&thread_ids, new_worktree_paths, cx);
             });

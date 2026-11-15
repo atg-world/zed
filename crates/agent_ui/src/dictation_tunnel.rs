@@ -515,6 +515,14 @@ fn with_chat<R>(
         let started = window.update(cx, |multi_workspace, window, cx| {
             for workspace in multi_workspace.workspaces() {
                 if let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
+                    let show = |paths: &workspace::PathList| paths.ordered_paths().map(|p| p.display().to_string()).collect::<Vec<_>>().join(";");
+                    let project_folders = show(workspace.read(cx).project().read(cx).worktree_paths(cx).folder_path_list());
+                    let chat_folders = show(metadata.folder_paths());
+                    if project_folders != chat_folders {
+                        log::warn!(
+                            "[dictation] chat {id}: loading into a panel whose project folders [{project_folders}] differ from the chat's [{chat_folders}]; the chat's saved folder will follow the panel"
+                        );
+                    }
                     let metadata = metadata.clone();
                     panel.update(cx, |panel, cx| {
                         panel.load_agent_thread(
