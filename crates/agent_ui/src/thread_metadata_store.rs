@@ -669,6 +669,28 @@ impl ThreadMetadataStore {
                     return;
                 };
 
+                // What was loaded (ERP-2380): a chat without a folder, or in the wrong one, is the likeliest reason it will not open.
+                {
+                    let archived = rows.iter().filter(|row| row.archived).count();
+                    let drafts = rows.iter().filter(|row| row.is_draft()).count();
+                    let without_folder: Vec<String> = rows
+                        .iter()
+                        .filter(|row| !row.archived && row.folder_paths().is_empty())
+                        .map(|row| {
+                            row.session_id
+                                .as_ref()
+                                .map(|id| id.0.chars().take(8).collect::<String>())
+                                .unwrap_or_else(|| "draft".to_string())
+                        })
+                        .collect();
+                    log::info!(
+                        "[threads] loaded {} chats ({archived} archived, {drafts} drafts, {} active without a folder: {:?})",
+                        rows.len(),
+                        without_folder.len(),
+                        without_folder
+                    );
+                }
+
                 this.update(cx, |this, cx| {
                     this.threads.clear();
                     this.threads_by_paths.clear();
@@ -743,6 +765,13 @@ impl ThreadMetadataStore {
     fn save_internal(&mut self, metadata: ThreadMetadata) {
         if let Some(thread) = self.threads.get(&metadata.thread_id) {
             if thread.folder_paths() != metadata.folder_paths() {
+                let show = |paths: &PathList| paths.ordered_paths().map(|p| p.display().to_string()).collect::<Vec<_>>().join(";");
+                log::info!(
+                    "[threads] chat {} folder changed: [{}] -> [{}]",
+                    metadata.session_id.as_ref().map(|id| id.0.chars().take(8).collect::<String>()).unwrap_or_else(|| "draft".to_string()),
+                    show(thread.folder_paths()),
+                    show(metadata.folder_paths())
+                );
                 if let Some(thread_ids) = self.threads_by_paths.get_mut(thread.folder_paths()) {
                     thread_ids.remove(&metadata.thread_id);
                 }

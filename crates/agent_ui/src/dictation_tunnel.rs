@@ -229,7 +229,15 @@ fn start(cx: &mut App) -> anyhow::Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let port = listener.local_addr()?.port();
     let token = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
-    write_descriptor(&serde_json::json!({ "port": port, "token": token }).to_string())?;
+    // Two copies of Zed share one descriptor file: the later one overwrites the earlier one's port, and the PC then talks to it. Say so.
+    if let Ok(previous) = std::fs::read_to_string(descriptor_path()) {
+        let previous_pid = serde_json::from_str::<serde_json::Value>(&previous).ok().and_then(|v| v["pid"].as_u64());
+        if previous_pid != Some(u64::from(std::process::id())) {
+            log::warn!("[dictation] replacing a tunnel descriptor written by another Zed (pid {previous_pid:?}); this Zed is pid {}", std::process::id());
+        }
+    }
+    write_descriptor(&serde_json::json!({ "port": port, "token": token, "pid": std::process::id() }).to_string())?;
+    log::info!("[dictation] tunnel on 127.0.0.1:{port} (pid {}, descriptor {})", std::process::id(), descriptor_path().display());
 
     let stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = async_channel::unbounded::<Pending>();
@@ -493,11 +501,16 @@ fn with_chat<R>(
     }
     // not in memory: ask the first agent panel to load it (without stealing focus), and tell the caller to ask again
     let Some(store) = ThreadMetadataStore::try_global(cx) else {
+        log::info!("[dictation] chat {id}: no chat store yet");
         return Err("no-chat");
     };
     let Some(metadata) = store.read(cx).entries().find(|m| m.thread_id.to_key_string() == id).cloned() else {
+        log::info!("[dictation] chat {id}: not in this Zed's chat list (another Zed, or deleted)");
         return Err("no-chat");
     };
+    if metadata.folder_paths().is_empty() {
+        log::info!("[dictation] chat {id}: has no folder in its saved settings");
+    }
     for window in zed_windows(cx) {
         let started = window.update(cx, |multi_workspace, window, cx| {
             for workspace in multi_workspace.workspaces() {
@@ -521,9 +534,11 @@ fn with_chat<R>(
             false
         });
         if matches!(started, Ok(true)) {
+            log::info!("[dictation] chat {id}: not in memory, loading it in the background");
             return Err("loading");
         }
     }
+    log::info!("[dictation] chat {id}: no agent panel open in any window to load it into");
     Err("no-chat")
 }
 

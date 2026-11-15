@@ -1467,6 +1467,10 @@ impl ConversationView {
                 opened_at.elapsed().as_millis(),
                 result.is_ok()
             );
+            if let Err(error) = &result {
+                // the reason a chat would not open (ERP-2380): ids and the error text only, never chat content
+                log::warn!("[chat-open] chat={chat_label} load-failed error={error:#}");
+            }
             let result = match result {
                 Err(error) => {
                     if let Some(auth_required) = AuthRequired::from_error(&error) {
