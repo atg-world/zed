@@ -565,13 +565,15 @@ enum LoadOutcome {
     NoPanel,
 }
 
-/// The folders of a chat or a project as one comparable string: lower case, one kind of slash, in the order Zed keeps them.
+/// The folders of a chat or a project as one comparable string: lower case, one kind of slash, no trailing separator, and sorted, so
+/// two projects holding the same folders added in a different order are the same project (as `PathList` equality also treats them).
 fn folders_key(paths: &workspace::PathList) -> String {
-    paths
+    let mut folders: Vec<String> = paths
         .ordered_paths()
         .map(|path| path.display().to_string().replace('/', "\\").trim_end_matches('\\').to_lowercase())
-        .collect::<Vec<_>>()
-        .join(";")
+        .collect();
+    folders.sort();
+    folders.join(";")
 }
 
 fn read_chat(id: &str, limit: usize, cx: &mut App) -> serde_json::Value {
@@ -710,6 +712,9 @@ mod tests {
         assert_eq!(folders_key(&a), folders_key(&b));
         assert_ne!(folders_key(&a), folders_key(&other), "a parent folder is not the same project");
         assert_eq!(folders_key(&workspace::PathList::default()), "");
+        let ab = workspace::PathList::new(&[std::path::PathBuf::from("C:\\a"), std::path::PathBuf::from("C:\\b")]);
+        let ba = workspace::PathList::new(&[std::path::PathBuf::from("C:\\b"), std::path::PathBuf::from("C:\\a")]);
+        assert_eq!(folders_key(&ab), folders_key(&ba), "the order the folders were added in does not matter");
     }
 
     #[test]
