@@ -508,46 +508,70 @@ fn with_chat<R>(
         log::info!("[dictation] chat {id}: not in this Zed's chat list (another Zed, or deleted)");
         return Err("no-chat");
     };
-    if metadata.folder_paths().is_empty() {
-        log::info!("[dictation] chat {id}: has no folder in its saved settings");
+    // A chat belongs to the project (the folders) it was started in, and Zed saves the folders of whichever project a chat is loaded into
+    // over the chat's own (thread_metadata_store.rs). So a sleeping chat is loaded only into the workspace whose project IS the chat's
+    // folder. Loading it into "the first panel" moved chats to another project's group in the sidebar (ERP-2380). A chat that has no
+    // folder yet may go anywhere; a chat whose project is not open is refused (`project-closed`), never put somewhere else.
+    let wanted = folders_key(metadata.folder_paths());
+    if wanted.is_empty() {
+        log::info!("[dictation] chat {id}: has no folder in its saved settings; it will be loaded into the first agent panel");
     }
+    let mut project_is_closed = false;
     for window in zed_windows(cx) {
-        let started = window.update(cx, |multi_workspace, window, cx| {
+        let outcome = window.update(cx, |multi_workspace, window, cx| {
+            let mut saw_panel = false;
             for workspace in multi_workspace.workspaces() {
-                if let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
-                    let show = |paths: &workspace::PathList| paths.ordered_paths().map(|p| p.display().to_string()).collect::<Vec<_>>().join(";");
-                    let project_folders = show(workspace.read(cx).project().read(cx).worktree_paths(cx).folder_path_list());
-                    let chat_folders = show(metadata.folder_paths());
-                    if project_folders != chat_folders {
-                        log::warn!(
-                            "[dictation] chat {id}: loading into a panel whose project folders [{project_folders}] differ from the chat's [{chat_folders}]; the chat's saved folder will follow the panel"
-                        );
-                    }
-                    let metadata = metadata.clone();
-                    panel.update(cx, |panel, cx| {
-                        panel.load_agent_thread(
-                            Agent::from(metadata.agent_id.clone()),
-                            metadata.thread_id,
-                            Some(metadata.worktree_paths.folder_path_list().clone()),
-                            metadata.title.clone(),
-                            false,
-                            AgentThreadSource::AgentPanel,
-                            window,
-                            cx,
-                        );
-                    });
-                    return true;
+                let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) else { continue };
+                saw_panel = true;
+                let project_folders = folders_key(workspace.read(cx).project().read(cx).worktree_paths(cx).folder_path_list());
+                if !wanted.is_empty() && project_folders != wanted {
+                    continue;
                 }
+                log::info!("[dictation] chat {id}: loading into the panel of project [{project_folders}] (chat folder [{wanted}])");
+                let metadata = metadata.clone();
+                panel.update(cx, |panel, cx| {
+                    panel.load_agent_thread(
+                        Agent::from(metadata.agent_id.clone()),
+                        metadata.thread_id,
+                        Some(metadata.worktree_paths.folder_path_list().clone()),
+                        metadata.title.clone(),
+                        false,
+                        AgentThreadSource::AgentPanel,
+                        window,
+                        cx,
+                    );
+                });
+                return LoadOutcome::Started;
             }
-            false
+            if saw_panel { LoadOutcome::NoMatchingProject } else { LoadOutcome::NoPanel }
         });
-        if matches!(started, Ok(true)) {
-            log::info!("[dictation] chat {id}: not in memory, loading it in the background");
-            return Err("loading");
+        match outcome {
+            Ok(LoadOutcome::Started) => return Err("loading"),
+            Ok(LoadOutcome::NoMatchingProject) => project_is_closed = true,
+            _ => {}
         }
+    }
+    if project_is_closed {
+        log::warn!("[dictation] chat {id}: its project [{wanted}] is not open in any window, so it was not loaded (loading it elsewhere would move it)");
+        return Err("project-closed");
     }
     log::info!("[dictation] chat {id}: no agent panel open in any window to load it into");
     Err("no-chat")
+}
+
+enum LoadOutcome {
+    Started,
+    NoMatchingProject,
+    NoPanel,
+}
+
+/// The folders of a chat or a project as one comparable string: lower case, one kind of slash, in the order Zed keeps them.
+fn folders_key(paths: &workspace::PathList) -> String {
+    paths
+        .ordered_paths()
+        .map(|path| path.display().to_string().replace('/', "\\").trim_end_matches('\\').to_lowercase())
+        .collect::<Vec<_>>()
+        .join(";")
 }
 
 fn read_chat(id: &str, limit: usize, cx: &mut App) -> serde_json::Value {
@@ -676,6 +700,16 @@ mod tests {
         assert_eq!(answer["active"], "b");
         assert_eq!(answer["chats"].as_array().map(|list| list.len()), Some(2));
         assert!(chats_answer(chats, None)["active"].is_null(), "no chat showing: null, so a phone does not follow anything");
+    }
+
+    #[test]
+    fn folders_compare_without_case_slash_or_trailing_separator() {
+        let a = workspace::PathList::new(&[std::path::PathBuf::from("C:/Users/saura/Documents/vidya/")]);
+        let b = workspace::PathList::new(&[std::path::PathBuf::from("c:\\users\\saura\\documents\\vidya")]);
+        let other = workspace::PathList::new(&[std::path::PathBuf::from("C:\\Users\\saura\\Documents")]);
+        assert_eq!(folders_key(&a), folders_key(&b));
+        assert_ne!(folders_key(&a), folders_key(&other), "a parent folder is not the same project");
+        assert_eq!(folders_key(&workspace::PathList::default()), "");
     }
 
     #[test]
